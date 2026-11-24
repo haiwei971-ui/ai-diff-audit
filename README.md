@@ -21,7 +21,7 @@ When AI coding agents hit a stubborn test failure or linter error, they often op
 - Silencing checks with `# type: ignore`, `# noqa`, `// @ts-ignore`, or `eslint-disable`
 - Drifting outside the requested scope into lockfiles, CI workflows, or migrations
 
-`ai-diff-audit` inspects **only the changed lines in your unified `git diff`** (never noisy legacy code) using pure Python 3 stdlib + Bash and prints a deterministic **PR Verification Receipt**.
+`ai-diff-audit` checks changed files and lines in your unified `git diff` using pure Python 3 stdlib + Bash and prints a deterministic **PR Verification Receipt**. It uses adjacent context to catch an existing `except` handler whose body changes to `pass`.
 
 ---
 
@@ -44,7 +44,12 @@ bash ai-diff-audit/scripts/ai-diff-audit.sh --working --allow-path src/auth --al
 
 # 5. CI / JSON mode (fail on warnings too)
 bash ai-diff-audit/scripts/ai-diff-audit.sh --base origin/main --strict --json
+
+# 6. Review a patch supplied by another tool
+git diff main...HEAD | bash ai-diff-audit/scripts/ai-diff-audit.sh --diff-file - --json
 ```
+
+`--working` covers tracked changes, including staged changes. To include a new untracked file, stage it first. `--allow-path` matches the exact path or its descendants and checks both ends of a rename. Deletions, binary files, and permission-only changes count toward scope. A truncated hunk returns exit code 2.
 
 ---
 
@@ -79,7 +84,7 @@ Findings:
 | Rule | Severity | What It Catches (Changed Lines Only) |
 | :--- | :--- | :--- |
 | `TEST_SKIP_ADDED` | `CRITICAL` | `@pytest.mark.skip`, `xfail`, `unittest.skip`, `it.skip`, `xit`, `t.Skip`, `#[ignore]` |
-| `DELETED_TEST_ASSERTIONS` | `CRITICAL` | Net-deleted `assert`, `expect(...)`, `assert_eq!`, `t.Error`/`t.Fatal` in test files |
+| `DELETED_TEST_ASSERTIONS` | `CRITICAL` | Net-deleted `assert`, `expect(...)`, `assert_eq!`, `t.Error`/`t.Fatal`, including when the whole test file is removed |
 | `ERROR_MASKING` | `CRITICAL` | `\|\| true`, `; true`, `set +e`, inline/multi-line `except: pass`, empty `catch {}` |
 | `LEAKED_SECRET` | `CRITICAL` | `sk-`, `ghp_`, `github_pat_`, `AKIA`, `xox*`, private key headers, DB password URIs (auto-redacted in output; ignores obvious placeholders) |
 | `MERGE_CONFLICT_MARKER` | `CRITICAL` | Unresolved `<<<<<<<`, `=======`, `>>>>>>>` markers |
@@ -92,6 +97,8 @@ Findings:
 ---
 
 ## Run Tests Locally
+
+A PASS means the diff triggered none of the configured checks. Run the project's tests and review the behavioral changes before merging.
 
 ```bash
 bash tests/run-tests.sh
