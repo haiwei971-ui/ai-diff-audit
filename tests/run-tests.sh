@@ -136,4 +136,83 @@ echo "[PASS] Test 4: --allow-path caught OUT_OF_SCOPE_EDIT"
 bash "${AUDIT}" --repo "${TMP_REPO}" --working --allow-path src/ | grep -q "=== AI DIFF AUDIT RECEIPT ==="
 echo "[PASS] Test 5: Human-readable PR receipt renders cleanly"
 
+# Test structural edge cases through the CLI using Git-generated patches.
+python3 - "${ROOT_DIR}/scripts/audit-diff.py" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+audit = sys.argv[1]
+
+with TemporaryDirectory() as tmp:
+    repo = Path(tmp)
+
+    def git(*args):
+        return subprocess.check_output(["git", "-C", tmp, *args])
+
+    def check(*args, patch=None, code=1):
+        result = subprocess.run(
+            [sys.executable, audit, "--repo", tmp, "--json", *args],
+            input=patch, capture_output=True,
+        )
+        assert result.returncode == code, result
+        return json.loads(result.stdout) if code != 2 else result.stderr.decode()
+
+    git("init", "-q")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    (repo / "tests").mkdir()
+    (repo / "src.v2").mkdir()
+    (repo / "src").mkdir()
+    (repo / "tests/test_all.py").write_text("assert 1 + 1 == 2\n", encoding="utf-8")
+    (repo / "src.v2/名称.py").write_text("try:\n    run()\nexcept RuntimeError:\n    raise\n", encoding="utf-8")
+    (repo / "src/with spaces").write_text("unchanged\n", encoding="utf-8")
+    (repo / "src/task.py.backup").write_text("original\n", encoding="utf-8")
+    (repo / "external binary").write_bytes(b"\0old\n")
+    git("add", ".")
+    assert check("--working", code=0)["summary"]["files_changed"] == 5
+    git("commit", "-qm", "fixtures")
+
+    git("rm", "tests/test_all.py")
+    git("mv", "src/with spaces", "src.v2/moved file")
+    (repo / "src/task.py.backup").chmod(0o755)
+    git("add", "src/task.py.backup")
+    (repo / "external binary").write_bytes(b"\0new\n")
+    (repo / "src.v2/名称.py").write_text("try:\n    run()\nexcept RuntimeError:\n    pass\n", encoding="utf-8")
+    payload = check("--working", "--allow-path", "src.v2/", "--allow-path", "src/task.py")
+    summary = payload["summary"]
+    assert summary["files_changed"] == 5 and summary["lines_removed"] == 2, summary
+    findings = {(f["rule"], f["file"], f["line"]) for f in payload["findings"]}
+    assert ("DELETED_TEST_ASSERTIONS", "tests/test_all.py", 0) in findings, findings
+    assert ("ERROR_MASKING", "src.v2/名称.py", 4) in findings, findings
+    assert {f[1] for f in findings if f[0] == "OUT_OF_SCOPE_EDIT"} == {
+        "tests/test_all.py", "src/with spaces", "src/task.py.backup", "external binary",
+    }, findings
+
+    git("add", "--", "src.v2/名称.py", "external binary")
+    git("commit", "-qm", "audit inputs")
+    assert check("--base", "HEAD~1")["summary"]["files_changed"] == 5
+    assert "Could not resolve base ref" in check("--base=--name-only", code=2)
+
+    token = "ghp_" + "AaBbCcDdEeFfGgHhIiJjKkLl"
+    patch = (
+        "--- a/tests/example.py\n+++ b/tests/example.py\n@@ -1,2 +1,2 @@\n"
+        " ---- context\n--- removed\n"
+        f'+++ "{token}" # example value\r\n'
+        "--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-old\n+new\n"
+    ).encode("ascii")
+    patch_file = repo / "fixture.diff"
+    patch_file.write_bytes(patch)
+    for payload in (check("--diff-file", "-", patch=patch), check("--diff-file", str(patch_file))):
+        assert payload["summary"]["files"] == ["tests/example.py", "other.txt"], payload
+        assert payload["summary"]["lines_added"] == payload["summary"]["lines_removed"] == 2, payload
+        assert token not in json.dumps(payload), "Unredacted test token in receipt"
+        assert {f["rule"] for f in payload["findings"]} == {"LEAKED_SECRET", "HIDDEN_CRLF"}, payload
+    malformed = b"--- a/example.py\n+++ b/example.py\n@@ -0,0 +1,2 @@\n+one\n"
+    assert "truncated" in check("--diff-file", "-", patch=malformed, code=2).lower()
+PY
+echo "[PASS] Test 6: Git paths, full deletion, context, patch input, and line counts"
+
 echo "ALL TESTS PASSED"
