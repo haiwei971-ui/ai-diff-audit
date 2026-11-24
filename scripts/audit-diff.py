@@ -14,13 +14,13 @@ License: MIT
 """
 
 import argparse
+import codecs
 import json
-import os
 import re
 import subprocess
 import sys
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 
 @dataclass
@@ -134,28 +134,46 @@ def is_sensitive_path(path: str) -> bool:
 
 
 def run_git_diff(repo_dir: str, mode: str, base_ref: Optional[str]) -> str:
-    cmd = ["git", "-C", repo_dir, "diff", "--no-color", "--unified=1"]
+    git = ["git", "--no-optional-locks", "-C", repo_dir]
+    cmd = git + [
+        "-c", "core.quotePath=true", "-c", "diff.suppressBlankEmpty=false",
+        "diff", "--no-color", "--no-ext-diff", "--no-textconv",
+        "--no-relative", "--src-prefix=a/", "--dst-prefix=b/", "--find-renames", "--unified=1",
+        "--output-indicator-new=+", "--output-indicator-old=-", "--output-indicator-context= ",
+        "--submodule=short", "--ignore-submodules=none",
+    ]
     if mode == "staged":
         cmd.append("--cached")
     elif mode == "base":
         if not base_ref:
             raise ValueError("--base requires a git ref (e.g. main)")
-        cmd.append(f"{base_ref}...HEAD")
+        resolved = subprocess.run(
+            git + ["rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}"],
+            capture_output=True,
+        )
+        if resolved.returncode:
+            raise ValueError(f"Could not resolve base ref: {base_ref!r}")
+        cmd.append(f"{resolved.stdout.decode('ascii').strip()}...HEAD")
     elif mode == "working":
         # Include both staged and unstaged changes relative to HEAD when HEAD exists
         head_check = subprocess.run(
-            ["git", "-C", repo_dir, "rev-parse", "--verify", "HEAD"],
+            git + ["rev-parse", "--verify", "HEAD"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
         )
         if head_check.returncode == 0:
             cmd.append("HEAD")
+        else:
+            empty_tree = subprocess.run(
+                git + ["hash-object", "-t", "tree", "--stdin"], input=b"", capture_output=True, check=True,
+            )
+            cmd.append(empty_tree.stdout.decode("ascii").strip())
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
     proc = subprocess.run(
-        cmd,
+        cmd + ["--"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -166,6 +184,101 @@ def run_git_diff(repo_dir: str, mode: str, base_ref: Optional[str]) -> str:
     return proc.stdout.decode("utf-8", errors="replace")
 
 
+HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+QUOTED_PATH_RE = re.compile(r'^"(?:[^"\\]|\\.)*"')
+EXCEPT_HEADER_RE = re.compile(r"^([ \t]*)except(?:\s+[^:]+)?\s*:\s*(?:#.*)?$")
+PASS_RE = re.compile(r"^([ \t]*)pass\s*(?:#.*)?$")
+DISPLAY_CONTROLS = {i: repr(chr(i))[1:-1] for i in (*range(32), 127)}
+
+
+def patch_path(raw: str, prefix: str = "") -> Optional[str]:
+    quoted = QUOTED_PATH_RE.match(raw)
+    if quoted:
+        raw = codecs.escape_decode(quoted.group()[1:-1].encode("utf-8"))[0].decode("utf-8", "replace")
+    else:
+        raw = raw.partition("\t")[0]
+    return raw.removeprefix(prefix) if raw and raw != "/dev/null" else None
+
+
+def git_header_paths(raw: str) -> Tuple[Optional[str], Optional[str]]:
+    # On ordinary mode-only/binary changes Git prints the same path twice. Paths
+    # containing spaces can be unquoted, so splitting at the first space is unsafe.
+    midpoint = len(raw) // 2
+    if raw.startswith("a/") and raw[midpoint:midpoint + 3] == " b/":
+        old = patch_path(raw[:midpoint], "a/")
+        new = patch_path(raw[midpoint + 1:], "b/")
+        if old == new:
+            return old, new
+    quoted = QUOTED_PATH_RE.match(raw)
+    if quoted:
+        tail = raw[quoted.end():].removeprefix(" ")
+        return patch_path(quoted.group(), "a/"), patch_path(tail, "b/")
+    return None, None
+
+
+def diff_sections(diff_text: str) -> Iterator[Tuple[Optional[str], Optional[str], List[Tuple[str, int, str, bool]]]]:
+    old_path = new_path = None
+    changes = []
+    old_left = new_left = new_line = 0
+    git_header = False
+    has_hunk = False
+
+    for raw in diff_text.split("\n"):
+        line = raw.removesuffix("\r")
+        if old_left or new_left:
+            marker = line[:1]
+            if marker == "\\":
+                continue  # Git's "No newline at end of file" marker.
+            if marker not in (" ", "+", "-"):
+                raise ValueError("Invalid or truncated diff hunk")
+            changes.append((marker, new_line, line[1:], raw.endswith("\r")))
+            if marker != "+":
+                old_left -= 1
+            if marker != "-":
+                new_left -= 1
+                new_line += 1
+            if min(old_left, new_left) < 0:
+                raise ValueError("Invalid diff hunk line counts")
+            continue
+
+        if line.startswith("diff --git "):
+            yield old_path, new_path, changes
+            old_path, new_path = git_header_paths(line[len("diff --git "):])
+            git_header = True
+            has_hunk = False
+            changes = []
+        elif line.startswith(("rename from ", "copy from ")):
+            old_path = patch_path(line.split(" ", 2)[2])
+        elif line.startswith(("rename to ", "copy to ")):
+            new_path = patch_path(line.split(" ", 2)[2])
+        elif line.startswith("--- "):
+            if has_hunk and not git_header:
+                yield old_path, new_path, changes
+                changes = []
+            old_path = patch_path(line[4:], "a/")
+        elif line.startswith("+++ "):
+            new_path = patch_path(line[4:], "b/")
+        elif line.startswith("@@ "):
+            hunk = HUNK_RE.match(line)
+            if not hunk or not (old_path or new_path):
+                raise ValueError("Invalid diff hunk header")
+            old_left = int(hunk[1] or 1)
+            new_line = int(hunk[2])
+            new_left = int(hunk[3] or 1)
+            changes.append(("", new_line, "", False))
+            has_hunk = True
+        elif line.startswith("Binary files ") and not (old_path or new_path):
+            # External patches may mark one side /dev/null for a binary add/delete.
+            old_raw, boundary, new_raw = line[13:].removesuffix(" differ").partition(" and ")
+            if boundary:
+                old_path = patch_path(old_raw, "a/")
+                new_path = patch_path(new_raw, "b/")
+
+    if old_left or new_left:
+        raise ValueError("Truncated diff hunk")
+    yield old_path, new_path, changes
+
+
 def parse_and_audit_diff(
     diff_text: str,
     max_files: int,
@@ -173,73 +286,53 @@ def parse_and_audit_diff(
     allow_paths: List[str],
 ) -> Tuple[dict, List[Finding]]:
     findings: List[Finding] = []
-    files_seen: List[str] = []
+    files_seen: dict = {}
+    touched_paths: dict = {}
     total_added = 0
     total_removed = 0
     test_assertions_added: dict = {}
     test_assertions_removed: dict = {}
 
-    current_file: Optional[str] = None
-    new_line_no = 0
-    prev_added_was_bare_except: Optional[Tuple[int, str]] = None
     crlf_reported_files = set()
 
-    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-
-    for raw_line in diff_text.splitlines(keepends=True):
-        line_no_nl = raw_line.rstrip("\n")
-        has_cr = line_no_nl.endswith("\r")
-        line = line_no_nl.rstrip("\r")
-
-        if line.startswith("diff --git "):
-            prev_added_was_bare_except = None
+    for old_path, new_path, changes in diff_sections(diff_text):
+        current_file = new_path or old_path
+        if not current_file:
             continue
+        files_seen[current_file] = None
+        for path in (old_path, new_path):
+            if path:
+                touched_paths[path] = None
 
-        if line.startswith("+++ "):
-            target = line[4:].strip()
-            if target == "/dev/null":
-                current_file = None
+        test_file = any(is_test_file(path) for path in (old_path, new_path) if path)
+        prev_except = None
+        for marker, line_num, content, has_cr in changes:
+            if marker == "-":
+                total_removed += 1
+                if test_file and ASSERTION_PATTERNS.search(content):
+                    test_assertions_removed[current_file] = test_assertions_removed.get(current_file, 0) + 1
+                continue
+
+            if marker in (" ", "+"):
+                pass_line = PASS_RE.match(content)
+                if prev_except and pass_line:
+                    exc_line, exc_content, exc_indent, exc_added = prev_except
+                    if len(pass_line[1].expandtabs(8)) > exc_indent and (exc_added or marker == "+"):
+                        findings.append(Finding(
+                            "CRITICAL", "ERROR_MASKING", current_file,
+                            exc_line if exc_added else line_num,
+                            "Added multi-line 'except: pass' swallowing errors",
+                            redact_snippet(f"{exc_content.strip()} -> pass"),
+                        ))
+                exc = EXCEPT_HEADER_RE.match(content)
+                prev_except = (line_num, content, len(exc[1].expandtabs(8)), marker == "+") if exc else None
             else:
-                if target.startswith("b/"):
-                    target = target[2:]
-                current_file = target
-                if current_file not in files_seen:
-                    files_seen.append(current_file)
-            prev_added_was_bare_except = None
-            continue
+                prev_except = None
 
-        if line.startswith("--- "):
-            continue
+            if marker != "+":
+                continue
 
-        m_hunk = hunk_re.match(line)
-        if m_hunk:
-            new_line_no = int(m_hunk.group(1))
-            prev_added_was_bare_except = None
-            continue
-
-        if current_file is None:
-            continue
-
-        # Context line
-        if line.startswith(" "):
-            new_line_no += 1
-            prev_added_was_bare_except = None
-            continue
-
-        # Removed line
-        if line.startswith("-") and not line.startswith("---"):
-            total_removed += 1
-            content = line[1:]
-            if is_test_file(current_file) and ASSERTION_PATTERNS.search(content):
-                test_assertions_removed[current_file] = test_assertions_removed.get(current_file, 0) + 1
-            continue
-
-        # Added line
-        if line.startswith("+") and not line.startswith("+++"):
             total_added += 1
-            content = line[1:]
-            line_num = new_line_no
-            new_line_no += 1
 
             # 1. Hidden CRLF check
             if has_cr and current_file not in crlf_reported_files:
@@ -269,23 +362,22 @@ def parse_and_audit_diff(
                 )
 
             # 3. Secrets in added lines
-            if not PLACEHOLDER_SECRET_RE.search(content):
-                for pat, msg in SECRET_PATTERNS:
-                    if pat.search(content):
-                        findings.append(
-                            Finding(
-                                severity="CRITICAL",
-                                rule="LEAKED_SECRET",
-                                file=current_file,
-                                line=line_num,
-                                message=msg,
-                                snippet=redact_snippet(content),
-                            )
+            for pat, msg in SECRET_PATTERNS:
+                if any(not PLACEHOLDER_SECRET_RE.search(match[0]) for match in pat.finditer(content)):
+                    findings.append(
+                        Finding(
+                            severity="CRITICAL",
+                            rule="LEAKED_SECRET",
+                            file=current_file,
+                            line=line_num,
+                            message=msg,
+                            snippet=redact_snippet(content),
                         )
-                        break
+                    )
+                    break
 
             # 4. Test-skipping cheats
-            if is_test_file(current_file):
+            if test_file:
                 if ASSERTION_PATTERNS.search(content):
                     test_assertions_added[current_file] = test_assertions_added.get(current_file, 0) + 1
                 for pat, msg in SKIP_TEST_PATTERNS:
@@ -315,25 +407,6 @@ def parse_and_audit_diff(
                         )
                     )
 
-            # Two-line Python `except ...:\n    pass`
-            if prev_added_was_bare_except is not None:
-                if re.match(r"^\s*pass\s*(#.*)?$", content):
-                    exc_line, exc_content = prev_added_was_bare_except
-                    findings.append(
-                        Finding(
-                            severity="CRITICAL",
-                            rule="ERROR_MASKING",
-                            file=current_file,
-                            line=exc_line,
-                            message="Added multi-line 'except: pass' swallowing errors",
-                            snippet=redact_snippet(f"{exc_content.strip()} -> pass"),
-                        )
-                    )
-                prev_added_was_bare_except = None
-
-            if re.match(r"^\s*except(\s+[\w.(), ]+)?\s*:\s*(#.*)?$", content):
-                prev_added_was_bare_except = (line_num, content)
-
             # 6. Linter / type-checker suppressions
             for pat, msg in LINTER_SILENCE_PATTERNS:
                 if pat.search(content):
@@ -350,7 +423,7 @@ def parse_and_audit_diff(
 
             # 7. Debug residue (skip console.log warnings inside test files)
             for pat, msg in DEBUG_RESIDUE_PATTERNS:
-                if "console.log" in msg and is_test_file(current_file):
+                if "console.log" in msg and test_file:
                     continue
                 if pat.search(content):
                     findings.append(
@@ -390,7 +463,7 @@ def parse_and_audit_diff(
             )
 
     # Sensitive path touches
-    for fpath in files_seen:
+    for fpath in touched_paths:
         if is_sensitive_path(fpath):
             findings.append(
                 Finding(
@@ -403,13 +476,10 @@ def parse_and_audit_diff(
             )
 
     # Out-of-scope paths (when --allow-path is provided)
-    normalized_allows = [p.rstrip("/") + "/" if not os.path.splitext(p)[1] else p for p in allow_paths]
+    normalized_allows = [p.removeprefix("./").rstrip("/") for p in allow_paths]
     if allow_paths:
-        for fpath in files_seen:
-            allowed = any(
-                fpath == raw.rstrip("/") or fpath.startswith(norm)
-                for raw, norm in zip(allow_paths, normalized_allows)
-            )
+        for fpath in touched_paths:
+            allowed = any(path == "." or fpath == path or fpath.startswith(path + "/") for path in normalized_allows)
             if not allowed:
                 findings.append(
                     Finding(
@@ -448,7 +518,7 @@ def parse_and_audit_diff(
 
     summary = {
         "files_changed": len(files_seen),
-        "files": files_seen,
+        "files": list(files_seen),
         "lines_added": total_added,
         "lines_removed": total_removed,
         "test_assertions_added": total_assert_added,
@@ -463,7 +533,7 @@ def parse_and_audit_diff(
 def format_receipt(scope_label: str, summary: dict, findings: List[Finding]) -> str:
     out = [
         "=== AI DIFF AUDIT RECEIPT ===",
-        f"Scope      : {scope_label}",
+        f"Scope      : {scope_label.translate(DISPLAY_CONTROLS)}",
         f"Verdict    : {summary['verdict']} (critical: {summary['critical_count']}, warnings: {summary['warning_count']})",
         f"Blast      : {summary['files_changed']} file(s), +{summary['lines_added']} / -{summary['lines_removed']} lines",
         f"Assertions : +{summary['test_assertions_added']} / -{summary['test_assertions_removed']} in test files",
@@ -474,11 +544,12 @@ def format_receipt(scope_label: str, summary: dict, findings: List[Finding]) -> 
         out.append("")
         out.append("Findings:")
         for idx, f in enumerate(findings, 1):
-            loc = f"{f.file}:{f.line}" if f.line > 0 else f.file
+            path = f.file.translate(DISPLAY_CONTROLS)
+            loc = f"{path}:{f.line}" if f.line > 0 else path
             out.append(f"  {idx}. [{f.severity}] {f.rule} @ {loc}")
-            out.append(f"     {f.message}")
+            out.append(f"     {f.message.translate(DISPLAY_CONTROLS)}")
             if f.snippet:
-                out.append(f"     > {f.snippet}")
+                out.append(f"     > {f.snippet.translate(DISPLAY_CONTROLS)}")
     out.append("=============================")
     return "\n".join(out)
 
@@ -509,10 +580,10 @@ def main() -> int:
     try:
         if args.diff_file:
             if args.diff_file == "-":
-                diff_text = sys.stdin.read()
+                diff_text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
                 scope_label = "stdin unified diff"
             else:
-                with open(args.diff_file, "r", encoding="utf-8", errors="replace") as fh:
+                with open(args.diff_file, "r", encoding="utf-8", errors="replace", newline="") as fh:
                     diff_text = fh.read()
                 scope_label = f"diff file ({args.diff_file})"
         elif args.staged:
@@ -524,16 +595,10 @@ def main() -> int:
         else:
             diff_text = run_git_diff(args.repo, "working", None)
             scope_label = "git diff HEAD (working tree)"
-    except Exception as exc:
+        summary, findings = parse_and_audit_diff(diff_text, args.max_files, args.max_lines, args.allow_path)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         print(f"[ai-diff-audit] ERROR: {exc}", file=sys.stderr)
         return 2
-
-    summary, findings = parse_and_audit_diff(
-        diff_text=diff_text,
-        max_files=args.max_files,
-        max_lines=args.max_lines,
-        allow_paths=args.allow_path,
-    )
 
     if args.json:
         payload = {
